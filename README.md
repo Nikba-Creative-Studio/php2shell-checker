@@ -59,6 +59,8 @@ php inspect.php --json               # structured JSON with evidence
 php inspect.php --html report.html   # shareable HTML report (or - for stdout)
 php inspect.php --recommend          # TAILORED remediation steps for what it found
 php inspect.php --recommend --json   # same recommendations, as JSON
+php inspect.php --prompt             # ready-to-paste prompt for an AI assistant
+php inspect.php --prompt --redact    # same, with absolute paths stripped
 #   run as root/sudo for full coverage of packages, logs and process times
 
 # Quick per-runtime scan: CLI, FPM, Apache, docker
@@ -113,6 +115,24 @@ its processes have been restarted.
 - This tool does not exploit, does not send payloads, and does not probe paths.
 - A patch does not remove malicious files or accounts created before patching —
   if you suspect compromise, investigate and rebuild from a verified source.
+
+## AI-assisted remediation
+
+`php inspect.php --prompt` turns the scan findings into a ready-to-paste prompt
+for an AI assistant (ChatGPT, Claude, …). The prompt embeds your per-runtime
+findings and the scanner's preliminary recommendations, then asks the model for
+an ordered, copy-paste remediation plan specific to your OS — while instructing
+it to produce **defensive remediation only, never exploit code**.
+
+```bash
+php inspect.php --prompt            # print the prompt
+php inspect.php --prompt --redact   # strip absolute paths first
+php inspect.php --prompt > fix.txt  # save it to paste later
+```
+
+> The prompt contains details about **your** server (versions, config, and
+> paths unless `--redact` is used). You are pasting it into an external service —
+> review it first.
 
 ## Remediation & hardening
 

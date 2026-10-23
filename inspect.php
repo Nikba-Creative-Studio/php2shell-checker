@@ -28,6 +28,9 @@
  *   php inspect.php                 # full text report
  *   php inspect.php --json          # structured JSON
  *   php inspect.php --html report.html   # write an HTML report (or - for stdout)
+ *   php inspect.php --recommend     # tailored, severity-ranked remediation steps
+ *   php inspect.php --prompt        # ready-to-paste prompt for an AI assistant
+ *   php inspect.php --prompt --redact    # same, with absolute paths stripped
  *
  * License: MIT.
  */
@@ -701,6 +704,119 @@ function render_recommendations(array $report, array $recs): string
 }
 
 // ---------------------------------------------------------------------------
+// AI-assisted remediation prompt (built from the scan findings)
+// ---------------------------------------------------------------------------
+
+/** Compact, human-readable findings block for embedding in an AI prompt. */
+function p2s_findings_block(array $report, bool $redact): string
+{
+    if (empty($report['runtimes'])) return "- (no PHP runtime detected)\n";
+    $lines = [];
+    foreach ($report['runtimes'] as $rt) {
+        $v = $rt['verdict'];
+        $bin = $rt['binary'] ?? null;
+        if ($redact && $bin) $bin = basename($bin);
+
+        $head = "- {$rt['label']}";
+        if (!empty($rt['version'])) $head .= " v{$rt['version']}";
+        $head .= " => {$v['status']} ({$v['confidence']})";
+        if ($bin) $head .= " [bin: {$bin}]";
+        if (!empty($rt['backport']['package'])) {
+            $head .= " [pkg: {$rt['backport']['package']}";
+            if (!empty($rt['backport']['pkg_version'])) $head .= " {$rt['backport']['pkg_version']}";
+            $head .= ']';
+        }
+        if (!empty($rt['restart']) && ($rt['restart']['state'] ?? 'unknown') !== 'unknown') {
+            $head .= " [restart: {$rt['restart']['state']}]";
+        }
+        $lines[] = $head;
+
+        foreach ($v['evidence'] as $e) $lines[] = "    - " . $e;
+
+        $ini = $rt['ini'] ?? [];
+        if ($ini) {
+            $flags = [];
+            if (array_key_exists('expose_php', $ini))
+                $flags[] = 'expose_php=' . (p2s_ini_on($ini['expose_php']) ? 'On' : 'Off');
+            if (array_key_exists('session.upload_progress.enabled', $ini))
+                $flags[] = 'session.upload_progress=' . (p2s_ini_on($ini['session.upload_progress.enabled']) ? 'On' : 'Off');
+            if (!empty($ini['memory_limit']))
+                $flags[] = 'memory_limit=' . $ini['memory_limit'];
+            if (!$redact && !empty($ini['loaded_ini']))
+                $flags[] = 'ini_file=' . $ini['loaded_ini'];
+            if ($flags) $lines[] = '    - config: ' . implode(', ', $flags);
+        }
+    }
+    return implode("\n", $lines) . "\n";
+}
+
+/** Build a ready-to-paste prompt that lets an AI produce tailored remediation. */
+function build_ai_prompt(array $report, array $recs, bool $redact): string
+{
+    $fam = $report['os_family'];
+    $findings = p2s_findings_block($report, $redact);
+
+    $recLines = '';
+    foreach ($recs as $i => $r) {
+        $recLines .= ($i + 1) . ". [{$r['severity']}] {$r['title']}\n";
+    }
+    if ($recLines === '') $recLines = "(none)\n";
+
+    $p  = "You are a senior Linux/PHP systems administrator assisting with DEFENSIVE\n";
+    $p .= "remediation only. Below is the output of a read-only posture scan for two\n";
+    $p .= "PHP engine vulnerabilities. Help me make this server safe.\n\n";
+
+    $p .= "## Vulnerabilities\n";
+    $p .= "- CVE-2026-109618 and CVE-2026-109619: unauthenticated remote code execution\n";
+    $p .= "  in the PHP engine, patched 2026-10-21. Highest risk on Apache + mod_php.\n";
+    $p .= "- Fixed versions by branch: 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (or a vendor\n";
+    $p .= "  backport). PHP 8.1 and older are end-of-life and need migration.\n\n";
+
+    $p .= "## My server\n";
+    $p .= "- OS family: {$fam}\n";
+    $p .= "- Overall verdict: {$report['overall']}\n";
+    $p .= "- Scanned at: {$report['scanned_at']}\n\n";
+
+    $p .= "## Findings per runtime\n";
+    $p .= $findings . "\n";
+
+    $p .= "## Preliminary recommendations from the scanner\n";
+    $p .= $recLines . "\n";
+
+    $p .= "## What I need from you\n";
+    $p .= "1. Give me an ORDERED, copy-paste remediation plan specific to my OS family\n";
+    $p .= "   ({$fam}) and the findings above. Use exact package and service names.\n";
+    $p .= "2. For each step, say in one line WHY it is needed and what it changes.\n";
+    $p .= "3. Treat 'patched package installed' and 'workers restarted' as SEPARATE\n";
+    $p .= "   requirements — a NEEDS_RESTART runtime needs only a restart, not a reinstall.\n";
+    $p .= "4. If a runtime is a distro package, account for backports: the base version\n";
+    $p .= "   number may look old while the fix is already applied.\n";
+    $p .= "5. For any end-of-life branch, outline a safe migration path to a supported one.\n";
+    $p .= "6. Finish with how to VERIFY success (re-running the scan, checking the\n";
+    $p .= "   running version in each SAPI) and a short post-patch hygiene checklist.\n";
+    $p .= "7. Clearly separate the real fix from optional hardening (e.g. hiding the\n";
+    $p .= "   version via expose_php / X-Powered-By is hygiene, NOT a fix).\n\n";
+
+    $p .= "## Rules\n";
+    $p .= "- Do NOT provide exploit code, proof-of-concept payloads, or attack steps.\n";
+    $p .= "- Do NOT suggest setting memory_limit to unlimited.\n";
+    $p .= "- Prefer official vendor packages; flag anything that could cause downtime so\n";
+    $p .= "  I can schedule it. If you need more detail, tell me to run\n";
+    $p .= "  `php inspect.php --json` and paste the result.\n";
+
+    // User-facing wrapper (not part of the prompt the AI reads).
+    $banner  = "# ---- Copy everything between the lines below into your AI assistant ----\n";
+    $banner .= "# NOTE: this prompt contains details about YOUR server (versions"
+             . ($redact ? "" : ", paths") . ", config).\n";
+    $banner .= "# You are pasting it into an external service" . ($redact ? " (paths redacted)." : ". Use --redact to strip absolute paths.") . "\n";
+    $banner .= str_repeat('-', 72) . "\n\n";
+    $footer  = "\n" . str_repeat('-', 72) . "\n";
+    $footer .= "# ---- End of prompt ----\n";
+
+    return $banner . $p . $footer;
+}
+
+// ---------------------------------------------------------------------------
 // Library guard + entry point
 // ---------------------------------------------------------------------------
 
@@ -716,6 +832,13 @@ if (PHP_SAPI !== 'cli') {
 
 $args = $argv ?? [];
 $report = full_scan();
+
+if (in_array('--prompt', $args, true)) {
+    $recs = build_recommendations($report);
+    echo build_ai_prompt($report, $recs, in_array('--redact', $args, true));
+    $exitP = ['PATCHED' => 0, 'CHECK_VIA_WEB' => 0, 'NEEDS_RESTART' => 1, 'VULNERABLE' => 1, 'UNSUPPORTED' => 1, 'UNKNOWN' => 2, 'NO_RUNTIME' => 2];
+    exit($exitP[$report['overall']] ?? 2);
+}
 
 if (in_array('--recommend', $args, true)) {
     $recs = build_recommendations($report);
