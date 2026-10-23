@@ -141,12 +141,6 @@ the real fix (patch + restart), version-hiding hygiene (`expose_php`,
 `X-Powered-By` for Apache/Nginx/Cloudflare), temporary mitigations, EOL
 migration, and a *fix vs hardening* quick reference.
 
-## Sources
-
-- PHP.net security release, 2026-10-21
-- [NCSC-NL/php2shell](https://github.com/NCSC-NL/php2shell) (CERT-EU tracked)
-- [nikba.com — PHP2Shell: PHP vulnerabilities and remediation](https://nikba.com/ro/articole/php2shell-vulnerabilitati-php-remediere)
-
 ## License
 
 MIT — see [LICENSE](LICENSE).

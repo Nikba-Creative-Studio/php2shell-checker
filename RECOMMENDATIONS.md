@@ -101,5 +101,3 @@ the server stays exposed; isolate it and prioritise.
 | Disable `session.upload_progress` | ⚠️ partial | Reduces one attack path (temporary) |
 | WAF / Cloudflare rules | ⚠️ partial | May block some payloads |
 | Migrate off EOL branch | ✅ (enables the fix) | Required for 7.4 / 8.0 / 8.1 |
-
-Sources: PHP.net security release 2026-10-21 · [NCSC-NL/php2shell](https://github.com/NCSC-NL/php2shell) · [nikba.com](https://nikba.com/ro/articole/php2shell-vulnerabilitati-php-remediere)
