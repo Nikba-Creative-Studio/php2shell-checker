@@ -119,10 +119,20 @@ its processes have been restarted.
 ## AI-assisted remediation
 
 `php inspect.php --prompt` turns the scan findings into a ready-to-paste prompt
-for an AI assistant (ChatGPT, Claude, …). The prompt embeds your per-runtime
-findings and the scanner's preliminary recommendations, then asks the model for
-an ordered, copy-paste remediation plan specific to your OS — while instructing
-it to produce **defensive remediation only, never exploit code**.
+for an AI assistant (ChatGPT, Claude, …). It is **specific to this scan**: the
+prompt builds one concrete task per runtime from the actual findings and asks
+the model to solve exactly those — while instructing it to produce **defensive
+remediation only, never exploit code**. Each task names the real detail it found:
+
+- a `VULNERABLE` runtime → its version and package, asked to upgrade + restart;
+- a `NEEDS_RESTART` runtime → asked to restart that exact service and confirm it;
+- an `UNSUPPORTED` (EOL) branch → asked for a migration plan to a supported one;
+- `CHECK_VIA_WEB` (Apache mod_php) → asked to confirm the build and patch it;
+- a Docker container → asked to rebuild on a patched image, not just restart;
+- config hygiene (`expose_php`, `session.upload_progress`) with its current value.
+
+When the package changelog can't be read, the task first asks the AI how to
+confirm whether the distro already backported the fix, before changing versions.
 
 ```bash
 php inspect.php --prompt            # print the prompt
