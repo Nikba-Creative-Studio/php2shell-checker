@@ -23,7 +23,7 @@
  *   2. Drop this file in your webroot and open it in a browser.
  *   3. DELETE IT IMMEDIATELY afterwards. Do not leave it reachable.
  *
- * License: MIT. Data from PHP.net and NCSC-NL/php2shell advisories.
+ * License: MIT.
  */
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@
 const ALLOW_WEB = false;
 
 // Fixed (patched) version for each supported PHP branch.
-// Source: PHP.net security release 2026-10-21 / NCSC-NL/php2shell.
+// Patched releases published 2026-10-21.
 const FIXED = [
     '8.2' => '8.2.35',
     '8.3' => '8.3.36',
@@ -124,7 +124,7 @@ function p2s_evaluate(string $version): array
         'version' => $version,
         'branch'  => $branch,
         'fixed'   => null,
-        'note'    => "Branch $branch is not in the known matrix. Check the PHP.net security advisory directly.",
+        'note'    => "Branch $branch is not in the known matrix. Check the official PHP security advisory directly.",
     ];
 }
 
@@ -149,7 +149,7 @@ function p2s_collect(): array
     $result = p2s_evaluate(PHP_VERSION);
     $result['sapi'] = $sapi;
 
-    // mod_php under Apache is the highest-risk configuration per PHP.net.
+    // mod_php under Apache is the highest-risk configuration.
     $result['highest_risk_sapi'] = ($sapi === 'apache2handler');
 
     // Temporary mitigation hint: session.upload_progress.

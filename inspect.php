@@ -642,7 +642,7 @@ function build_recommendations(array $report): array
         $recs[] = [
             'severity' => 'MEDIUM',
             'title'    => 'Manually verify runtime(s): ' . implode(', ', array_unique($unknown)),
-            'detail'   => 'Version or branch could not be mapped automatically. Check the running version against the PHP.net advisory for CVE-2026-109618 / CVE-2026-109619.',
+            'detail'   => 'Version or branch could not be mapped automatically. Check the running version against the official PHP security advisory for CVE-2026-109618 / CVE-2026-109619.',
             'commands' => [],
         ];
     }
