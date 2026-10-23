@@ -750,6 +750,96 @@ function p2s_findings_block(array $report, bool $redact): string
     return implode("\n", $lines) . "\n";
 }
 
+/**
+ * Turn the concrete findings into specific, per-runtime tasks for the AI,
+ * referencing the actual versions, packages, services and config this scan saw.
+ * @return array<int,string>
+ */
+function p2s_prompt_tasks(array $report, string $fam): array
+{
+    $tasks = [];
+    foreach ($report['runtimes'] as $rt) {
+        $status = $rt['verdict']['status'];
+        $label  = $rt['label'];
+        $ver    = $rt['version'] ?? null;
+        $branch = ($ver && preg_match('/^(\d+\.\d+)/', $ver, $m)) ? $m[1] : null;
+        $pkg    = $rt['backport']['package'] ?? null;
+        $pkgv   = $rt['backport']['pkg_version'] ?? null;
+        $svc    = $rt['restart']['service'] ?? null;
+        $fixed  = $branch ? (FIXED[$branch] ?? null) : null;
+        $pkgTxt = $pkg ? " (package {$pkg}" . ($pkgv ? " {$pkgv}" : '') . ')' : '';
+
+        // Containers are fixed by rebuilding the image, not by host package
+        // commands — handle them only here.
+        if ($rt['kind'] === 'docker') {
+            if (in_array($status, ['VULNERABLE', 'NEEDS_RESTART', 'UNKNOWN'], true)) {
+                $tasks[] = 'Container ' . ($rt['container'] ?? $label) . ' runs PHP ' . ($ver ?: '')
+                         . ' (verdict ' . $status . ') — give exact steps to rebuild it on a patched base image'
+                         . ' (not just `docker restart`) and redeploy.';
+            }
+            continue;
+        }
+
+        switch ($status) {
+            case 'VULNERABLE':
+                $t = "Fix {$label}" . ($ver ? " running PHP {$ver}{$pkgTxt}" : '')
+                   . ': upgrade it to ' . ($fixed ? "the fixed {$fixed} release or newer" : 'a fixed release')
+                   . " and restart it. Give the exact {$fam} package commands plus the restart command.";
+                if (($rt['backport']['backported'] ?? null) === null) {
+                    $t .= " My package changelog couldn't be read here, so FIRST show how to confirm"
+                        . " whether {$fam} has already backported the fix" . ($pkg ? " into {$pkg}" : '')
+                        . ", so I don't change versions needlessly.";
+                }
+                $tasks[] = $t;
+                break;
+            case 'NEEDS_RESTART':
+                $s = $svc ?: 'the php-fpm service';
+                $tasks[] = "{$label} already has the patched package installed, but its workers started"
+                         . " BEFORE the update and still run the old build. Give the exact command to restart {$s}"
+                         . " and a command to prove the running workers now use the fixed version.";
+                break;
+            case 'UNSUPPORTED':
+                $tasks[] = "{$label} runs end-of-life PHP " . ($ver ?: '') . ", which gets no fix. Give a concrete"
+                         . " migration plan on {$fam} to a currently-supported branch (8.3 or 8.4): install it alongside,"
+                         . " switch my web server/FPM pool to it, the top app-compatibility changes to check for this jump,"
+                         . " and how to roll back.";
+                break;
+            case 'CHECK_VIA_WEB':
+                $tasks[] = "Apache mod_php is loaded (the highest-risk setup) and its exact build can't be read from the"
+                         . " CLI. Walk me through safely confirming its running version via the web SAPI, then patching and"
+                         . " restarting Apache on {$fam}.";
+                break;
+            case 'UNKNOWN':
+                $tasks[] = "{$label}" . ($ver ? " (version {$ver})" : '') . " couldn't be classified automatically —"
+                         . " help me determine whether it is affected and what to do.";
+                break;
+        }
+    }
+
+    // Config hygiene, with the actual current state.
+    $exposeOn = false; $uploadOn = false;
+    foreach ($report['runtimes'] as $rt) {
+        $ini = $rt['ini'] ?? [];
+        if (array_key_exists('expose_php', $ini) && p2s_ini_on($ini['expose_php'])) $exposeOn = true;
+        if (array_key_exists('session.upload_progress.enabled', $ini) && p2s_ini_on($ini['session.upload_progress.enabled'])) $uploadOn = true;
+    }
+    if ($exposeOn) {
+        $tasks[] = "expose_php is currently On, so my PHP version leaks in the X-Powered-By header. As OPTIONAL"
+                 . " hardening (not a fix), show how to turn it off in php.ini and at the web-server level for {$fam}.";
+    }
+    if ($uploadOn) {
+        $tasks[] = "As a TEMPORARY mitigation only until I patch, show how to disable session.upload_progress and reload workers.";
+    }
+
+    $tasks = array_values(array_unique($tasks));
+
+    if (!$tasks) {
+        $tasks[] = "Every runtime this scan saw already looks patched and restarted. Give me a short checklist to be"
+                 . " certain (how to re-verify each SAPI) and the post-patch hygiene steps I shouldn't skip.";
+    }
+    return $tasks;
+}
+
 /** Build a ready-to-paste prompt that lets an AI produce tailored remediation. */
 function build_ai_prompt(array $report, array $recs, bool $redact): string
 {
@@ -783,19 +873,17 @@ function build_ai_prompt(array $report, array $recs, bool $redact): string
     $p .= "## Preliminary recommendations from the scanner\n";
     $p .= $recLines . "\n";
 
-    $p .= "## What I need from you\n";
-    $p .= "1. Give me an ORDERED, copy-paste remediation plan specific to my OS family\n";
-    $p .= "   ({$fam}) and the findings above. Use exact package and service names.\n";
-    $p .= "2. For each step, say in one line WHY it is needed and what it changes.\n";
-    $p .= "3. Treat 'patched package installed' and 'workers restarted' as SEPARATE\n";
-    $p .= "   requirements — a NEEDS_RESTART runtime needs only a restart, not a reinstall.\n";
-    $p .= "4. If a runtime is a distro package, account for backports: the base version\n";
-    $p .= "   number may look old while the fix is already applied.\n";
-    $p .= "5. For any end-of-life branch, outline a safe migration path to a supported one.\n";
-    $p .= "6. Finish with how to VERIFY success (re-running the scan, checking the\n";
-    $p .= "   running version in each SAPI) and a short post-patch hygiene checklist.\n";
-    $p .= "7. Clearly separate the real fix from optional hardening (e.g. hiding the\n";
-    $p .= "   version via expose_php / X-Powered-By is hygiene, NOT a fix).\n\n";
+    $p .= "## Exactly what I need you to solve (specific to this scan)\n";
+    $p .= "Give me an ORDERED, copy-paste plan on {$fam} that resolves each item below.\n";
+    $p .= "For every step say in one line WHY it is needed, and after each fix show the\n";
+    $p .= "exact command to VERIFY it worked. Treat 'patched package installed' and\n";
+    $p .= "'workers restarted' as SEPARATE requirements. Keep the real fix clearly apart\n";
+    $p .= "from optional hardening.\n\n";
+    foreach (p2s_prompt_tasks($report, $fam) as $i => $task) {
+        $p .= ($i + 1) . '. ' . wordwrap($task, 76, "\n   ", true) . "\n";
+    }
+    $p .= "\nFinish with a short post-patch hygiene checklist (a patch does not remove\n";
+    $p .= "files or accounts created before it).\n\n";
 
     $p .= "## Rules\n";
     $p .= "- Do NOT provide exploit code, proof-of-concept payloads, or attack steps.\n";
