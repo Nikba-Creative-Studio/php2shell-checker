@@ -177,6 +177,13 @@ php check.php --quiet          # exit code only: 0 patched, 1 vulnerable, 2 unkn
 
 ---
 
+## Remediation & hardening / Remediere și hardening
+
+See **[RECOMMENDATIONS.md](RECOMMENDATIONS.md)** for a copy-paste checklist:
+the real fix (patch + restart), version-hiding hygiene (`expose_php`,
+`X-Powered-By` for Apache/Nginx/Cloudflare), temporary mitigations, EOL
+migration, and a *fix vs hardening* quick reference.
+
 ## Sources
 
 - PHP.net security release, 2026-10-21
