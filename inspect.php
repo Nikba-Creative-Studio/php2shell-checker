@@ -1,0 +1,537 @@
+<?php
+/**
+ * php2shell-checker — inspect.php
+ *
+ * Deep, INFORMATIONAL server-posture scanner for CVE-2026-109618 /
+ * CVE-2026-109619. This goes well beyond reading a version number (which any
+ * online header scanner already shows): it answers the two questions that can
+ * only be answered ON the server, and which decide whether you are actually
+ * safe:
+ *
+ *   1. BACKPORT — did the OS vendor backport the fix even though the base
+ *      version number still looks old? (Debian/Ubuntu `dpkg`+changelog,
+ *      RHEL/Alma/Rocky `rpm --changelog`.) Resolves false positives.
+ *
+ *   2. RESTART — was the patched package actually loaded, i.e. were the
+ *      php-fpm/apache workers restarted AFTER the package was updated? A
+ *      patched package with un-restarted workers is STILL vulnerable.
+ *
+ * It also inventories every PHP runtime/SAPI and reads the risk-relevant ini
+ * settings, then prints a consolidated verdict with EVIDENCE as text, JSON, or
+ * a shareable HTML report.
+ *
+ * Purely informational: it reads versions, package metadata, process start
+ * times and ini values. It exploits nothing and sends no network requests.
+ * Run it ON the server (as root/sudo to see every runtime and package log).
+ *
+ * Usage:
+ *   php inspect.php                 # full text report
+ *   php inspect.php --json          # structured JSON
+ *   php inspect.php --html report.html   # write an HTML report (or - for stdout)
+ *
+ * License: MIT.
+ */
+
+// Load the shared version matrix / evaluator from check.php as a library.
+define('P2S_LIB', 1);
+require __DIR__ . '/check.php';
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/** Run a shell command, return [stdout, exit_code]. Empty/failed => ['', rc]. */
+function sh(string $cmd): array
+{
+    $out = @shell_exec($cmd . ' 2>/dev/null');
+    return [is_string($out) ? trim($out) : '', 0];
+}
+
+function have(string $bin): bool
+{
+    $p = @shell_exec('command -v ' . escapeshellarg($bin) . ' 2>/dev/null');
+    return is_string($p) && trim($p) !== '';
+}
+
+/** Detect the OS family: debian | rhel | alpine | macos | unknown. */
+function os_family(): string
+{
+    if (PHP_OS_FAMILY === 'Darwin') {
+        return 'macos';
+    }
+    if (is_readable('/etc/os-release')) {
+        $r = (string)@file_get_contents('/etc/os-release');
+        $like = '';
+        if (preg_match('/^ID_LIKE=(.*)$/m', $r, $m)) $like = strtolower(trim($m[1], " \"'"));
+        if (preg_match('/^ID=(.*)$/m', $r, $m))      $id   = strtolower(trim($m[1], " \"'")); else $id = '';
+        $hay = $id . ' ' . $like;
+        if (preg_match('/debian|ubuntu/', $hay))                    return 'debian';
+        if (preg_match('/rhel|fedora|centos|rocky|alma/', $hay))    return 'rhel';
+        if (preg_match('/alpine/', $hay))                           return 'alpine';
+    }
+    if (have('dpkg'))         return 'debian';
+    if (have('rpm'))          return 'rhel';
+    if (have('apk'))          return 'alpine';
+    return 'unknown';
+}
+
+/** Parse a PHP version from a `php -v` / `php-fpm -v` banner. */
+function version_from_banner(string $banner): ?string
+{
+    if (preg_match('/PHP\s+(\d+\.\d+\.\d+)/i', $banner, $m)) return $m[1];
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Backport detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine whether the package owning $binary has the CVE fix backported.
+ *
+ * @return array{backported:?bool, package:?string, pkg_version:?string, evidence:?string, method:string}
+ *   backported: true (CVE found in changelog), false (checked, not present), null (couldn't check)
+ */
+function backport_status(string $family, ?string $binary): array
+{
+    $none = ['backported' => null, 'package' => null, 'pkg_version' => null, 'evidence' => null, 'method' => 'unavailable'];
+    $cves = CVES;
+    $cvePattern = implode('|', array_map('preg_quote', $cves));
+
+    if ($family === 'debian' && $binary && have('dpkg')) {
+        [$pkg] = sh('dpkg -S ' . escapeshellarg($binary));
+        // "php8.4-cli: /usr/bin/php8.4" -> take package before the colon
+        $package = ($pkg && strpos($pkg, ':') !== false) ? trim(substr($pkg, 0, strpos($pkg, ':'))) : null;
+        if (!$package) return array_merge($none, ['method' => 'dpkg']);
+        [$pv] = sh('dpkg-query -W -f=\'${Version}\' ' . escapeshellarg($package));
+        // changelog lives in the -common or the package doc dir
+        $found = null; $evidence = null;
+        foreach ([$package, preg_replace('/-(cli|fpm|cgi)$/', '-common', $package)] as $p) {
+            foreach (["/usr/share/doc/$p/changelog.Debian.gz", "/usr/share/doc/$p/changelog.gz"] as $cl) {
+                if (is_readable($cl)) {
+                    [$hit] = sh('zcat ' . escapeshellarg($cl) . ' | grep -iE ' . escapeshellarg($cvePattern));
+                    if ($hit !== '') { $found = true; $evidence = strtok($hit, "\n"); break 2; }
+                    $found = false; // readable but no CVE
+                }
+            }
+        }
+        return ['backported' => $found, 'package' => $package, 'pkg_version' => ($pv ?: null),
+                'evidence' => $evidence, 'method' => 'dpkg+changelog'];
+    }
+
+    if ($family === 'rhel' && have('rpm')) {
+        $target = $binary ?: 'php';
+        [$pkg] = sh('rpm -qf ' . escapeshellarg($target));
+        $package = ($pkg && stripos($pkg, 'not owned') === false && $pkg !== '') ? strtok($pkg, "\n") : 'php';
+        [$chlog] = sh('rpm -q --changelog ' . escapeshellarg($package));
+        if ($chlog === '') return array_merge($none, ['package' => $package, 'method' => 'rpm']);
+        if (preg_match('/' . $cvePattern . '/i', $chlog, $m)) {
+            return ['backported' => true, 'package' => $package, 'pkg_version' => null,
+                    'evidence' => $m[0] . ' present in rpm changelog', 'method' => 'rpm+changelog'];
+        }
+        return ['backported' => false, 'package' => $package, 'pkg_version' => null,
+                'evidence' => null, 'method' => 'rpm+changelog'];
+    }
+
+    return $none;
+}
+
+// ---------------------------------------------------------------------------
+// Restart-after-patch detection
+// ---------------------------------------------------------------------------
+
+/** Epoch time the PHP package was last installed/upgraded, or null. */
+function package_update_time(string $family, ?string $package, ?string $binary): ?int
+{
+    if ($family === 'debian') {
+        if ($package) {
+            // Most recent install/upgrade of this package in dpkg logs.
+            [$line] = sh('grep -hE " (install|upgrade) ' . preg_quote((string)$package) . ':?" /var/log/dpkg.log /var/log/dpkg.log.1 2>/dev/null | tail -1');
+            if ($line && preg_match('/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/', $line, $m)) {
+                $t = strtotime($m[1]);
+                if ($t) return $t;
+            }
+        }
+    } elseif ($family === 'rhel' && $package && have('rpm')) {
+        [$last] = sh('rpm -q --last ' . escapeshellarg($package) . ' | head -1');
+        // "php-8.3.36-1.el9  Tue 21 Oct 2026 10:00:00 ..."
+        if ($last && preg_match('/\s{2,}(.+)$/', $last, $m)) {
+            $t = strtotime(trim($m[1]));
+            if ($t) return $t;
+        }
+    }
+    // Fallback: mtime of the binary (approximates install time).
+    if ($binary && is_file($binary)) {
+        $t = @filemtime($binary);
+        if ($t) return $t;
+    }
+    return null;
+}
+
+/**
+ * Earliest start epoch of the processes for a runtime, plus how it was found.
+ * @return array{start:?int, method:string, service:?string}
+ */
+function process_start_time(string $family, string $kind): array
+{
+    // Try systemd first for fpm/apache.
+    $services = [];
+    if ($kind === 'fpm') {
+        $services = ['php-fpm', 'php8.5-fpm', 'php8.4-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php-fpm.service'];
+    } elseif ($kind === 'apache') {
+        $services = ['apache2', 'httpd'];
+    }
+    if (have('systemctl')) {
+        foreach ($services as $svc) {
+            [$ts] = sh('systemctl show -p ActiveEnterTimestamp --value ' . escapeshellarg($svc));
+            if ($ts && stripos($ts, 'n/a') === false && trim($ts) !== '') {
+                $t = strtotime($ts);
+                if ($t) return ['start' => $t, 'method' => 'systemctl', 'service' => $svc];
+            }
+        }
+    }
+    // Fallback: earliest matching process start via ps.
+    $pattern = $kind === 'fpm' ? 'php-fpm' : ($kind === 'apache' ? 'apache2|httpd' : 'php');
+    [$out] = sh('ps -eo lstart=,command= | grep -E ' . escapeshellarg($pattern) . ' | grep -v grep');
+    $earliest = null;
+    foreach (explode("\n", $out) as $line) {
+        $line = trim($line);
+        if ($line === '') continue;
+        // lstart is the first 5 whitespace-separated fields (e.g. "Tue Oct 21 10:00:00 2026")
+        $parts = preg_split('/\s+/', $line);
+        if (count($parts) < 5) continue;
+        $stamp = implode(' ', array_slice($parts, 0, 5));
+        $t = strtotime($stamp);
+        if ($t && ($earliest === null || $t < $earliest)) $earliest = $t;
+    }
+    return ['start' => $earliest, 'method' => $earliest ? 'ps' : 'none', 'service' => null];
+}
+
+// ---------------------------------------------------------------------------
+// Per-runtime ini risk settings (run the actual binary so we see its config).
+// ---------------------------------------------------------------------------
+
+function ini_risk(string $binary): array
+{
+    $code = 'echo json_encode(['
+          . '"expose_php"=>ini_get("expose_php"),'
+          . '"session.upload_progress.enabled"=>ini_get("session.upload_progress.enabled"),'
+          . '"memory_limit"=>ini_get("memory_limit"),'
+          . '"loaded_ini"=>php_ini_loaded_file()]);';
+    [$out] = sh(escapeshellarg($binary) . ' -r ' . escapeshellarg($code));
+    $j = json_decode($out, true);
+    return is_array($j) ? $j : [];
+}
+
+// ---------------------------------------------------------------------------
+// Verdict engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Combine base version eval + backport + restart into a final verdict.
+ * Statuses: PATCHED, VULNERABLE, NEEDS_RESTART, UNSUPPORTED, UNKNOWN.
+ */
+function p2s_verdict(array $base, array $backport, ?string $restart): array
+{
+    $status   = $base['status'];
+    $conf     = 'version-based';
+    $evidence = [];
+
+    if ($backport['backported'] === true) {
+        $status = 'PATCHED';
+        $conf = 'confirmed (vendor changelog)';
+        $evidence[] = 'Backport confirmed: ' . ($backport['evidence'] ?: 'CVE id present in package changelog');
+    } elseif ($backport['backported'] === false) {
+        // Changelog readable and CVE not present.
+        if ($status === 'VULNERABLE') {
+            $conf = 'confirmed (vendor changelog: fix absent)';
+            $evidence[] = 'Vendor changelog checked; CVE ids not found.';
+        } elseif ($status === 'PATCHED') {
+            $evidence[] = 'Base version already >= fixed release.';
+        }
+    } else {
+        if ($status === 'VULNERABLE') {
+            $evidence[] = 'Could not read package changelog — verdict is version-based; a distro backport could still make this safe.';
+        }
+    }
+
+    // Restart gate only matters when the installed code is actually patched.
+    if ($status === 'PATCHED' && $restart === 'needs_restart') {
+        $status = 'NEEDS_RESTART';
+        $evidence[] = 'Patched package installed AFTER the workers started — the running processes have NOT loaded the fix yet. Restart them.';
+    } elseif ($status === 'PATCHED' && $restart === 'ok') {
+        $evidence[] = 'Workers started after the patch — running the fixed build.';
+    }
+
+    return ['status' => $status, 'confidence' => $conf, 'evidence' => $evidence];
+}
+
+// ---------------------------------------------------------------------------
+// Runtime enumeration + full scan
+// ---------------------------------------------------------------------------
+
+function enumerate_runtimes(string $family): array
+{
+    $runtimes = [];
+
+    // CLI binaries.
+    $seen = [];
+    foreach (['php','php8.2','php8.3','php8.4','php8.5','php82','php83','php84','php85'] as $name) {
+        if (!have($name)) continue;
+        [$path] = sh('command -v ' . escapeshellarg($name));
+        $real = $path ? (realpath($path) ?: $path) : $path;
+        if (!$real || isset($seen[$real])) continue;
+        $seen[$real] = true;
+        [$banner] = sh(escapeshellarg($real) . ' -v');
+        $runtimes[] = ['kind' => 'cli', 'label' => "CLI ($name)", 'binary' => $real,
+                       'version' => version_from_banner($banner)];
+    }
+
+    // FPM binaries.
+    $fpmSeen = [];
+    $fpmNames = ['php-fpm','php-fpm8.2','php-fpm8.3','php-fpm8.4','php-fpm8.5','php-fpm82','php-fpm83','php-fpm84','php-fpm85'];
+    $fpmPaths = [];
+    foreach ($fpmNames as $n) { if (have($n)) { [$p] = sh('command -v ' . escapeshellarg($n)); if ($p) $fpmPaths[] = $p; } }
+    foreach (glob('/usr/sbin/php-fpm*') ?: [] as $p) $fpmPaths[] = $p;
+    foreach (glob('/usr/local/sbin/php-fpm*') ?: [] as $p) $fpmPaths[] = $p;
+    foreach ($fpmPaths as $p) {
+        $real = realpath($p) ?: $p;
+        if (isset($fpmSeen[$real]) || !is_executable($real)) continue;
+        $fpmSeen[$real] = true;
+        [$banner] = sh(escapeshellarg($real) . ' -v');
+        $runtimes[] = ['kind' => 'fpm', 'label' => 'PHP-FPM', 'binary' => $real,
+                       'version' => version_from_banner($banner)];
+    }
+
+    // Apache mod_php (presence only; its build must be tested via the web SAPI).
+    $apache = null;
+    foreach (['apachectl','apache2ctl','httpd','apache2'] as $a) if (have($a)) { $apache = $a; break; }
+    if ($apache) {
+        [$mods] = sh($apache . ' -M');
+        if (stripos($mods, 'php') !== false) {
+            $runtimes[] = ['kind' => 'apache', 'label' => 'Apache mod_php', 'binary' => null, 'version' => null];
+        }
+    }
+
+    // Docker containers.
+    if (have('docker')) {
+        [$ps] = sh('docker ps --format "{{.ID}} {{.Names}}"');
+        foreach (explode("\n", $ps) as $line) {
+            $line = trim($line); if ($line === '') continue;
+            [$id, $name] = array_pad(explode(' ', $line, 2), 2, '');
+            [$banner] = sh('docker exec ' . escapeshellarg($id) . ' php -v');
+            $ver = version_from_banner($banner);
+            if (!$ver) continue;
+            $runtimes[] = ['kind' => 'docker', 'label' => "docker: $name", 'binary' => null,
+                           'version' => $ver, 'container' => $name];
+        }
+    }
+
+    return $runtimes;
+}
+
+function full_scan(): array
+{
+    $family = os_family();
+    $runtimes = enumerate_runtimes($family);
+    $report = [
+        'tool' => 'php2shell-checker/inspect',
+        'cves' => CVES,
+        'os_family' => $family,
+        'scanned_at' => gmdate('c'),
+        'is_root' => (function_exists('posix_geteuid') ? posix_geteuid() === 0 : null),
+        'runtimes' => [],
+    ];
+
+    foreach ($runtimes as $rt) {
+        $entry = $rt;
+
+        if ($rt['kind'] === 'apache') {
+            $entry['verdict'] = [
+                'status' => 'CHECK_VIA_WEB', 'confidence' => 'n/a',
+                'evidence' => ['mod_php is loaded (highest-risk SAPI). Its build cannot be read from the CLI — test it by placing check.php in the webroot with ALLOW_WEB=true, then delete it.'],
+            ];
+            $report['runtimes'][] = $entry;
+            continue;
+        }
+
+        $version = $rt['version'] ?? null;
+        if (!$version) {
+            $entry['verdict'] = ['status' => 'UNKNOWN', 'confidence' => 'n/a', 'evidence' => ['Could not read a version for this runtime.']];
+            $report['runtimes'][] = $entry;
+            continue;
+        }
+
+        $base = p2s_evaluate($version);
+
+        // Backport + restart only make sense for local, package-managed binaries.
+        if ($rt['kind'] === 'docker') {
+            $entry['backport'] = ['backported' => null, 'method' => 'n/a (container)'];
+            $entry['verdict'] = p2s_verdict($base, ['backported' => null, 'evidence' => null], null);
+            $entry['verdict']['evidence'][] = 'Container image: rebuild/pull a patched base image; restarting an old container keeps the vulnerable build.';
+        } else {
+            $backport = backport_status($family, $rt['binary'] ?? null);
+            $entry['backport'] = $backport;
+
+            $restart = null; $restartInfo = ['start' => null, 'method' => 'n/a', 'service' => null];
+            if ($rt['kind'] === 'fpm') {
+                $pkgTime = package_update_time($family, $backport['package'] ?? null, $rt['binary'] ?? null);
+                $restartInfo = process_start_time($family, 'fpm');
+                if ($pkgTime && $restartInfo['start']) {
+                    $restart = ($restartInfo['start'] >= $pkgTime) ? 'ok' : 'needs_restart';
+                }
+                $entry['restart'] = [
+                    'package_update_time' => $pkgTime ? gmdate('c', $pkgTime) : null,
+                    'process_start_time'  => $restartInfo['start'] ? gmdate('c', $restartInfo['start']) : null,
+                    'method' => $restartInfo['method'], 'service' => $restartInfo['service'],
+                    'state' => $restart ?: 'unknown',
+                ];
+            }
+
+            $entry['verdict'] = p2s_verdict($base, $backport, $restart);
+            $entry['ini'] = $rt['binary'] ? ini_risk($rt['binary']) : [];
+        }
+
+        $entry['base_status'] = $base['status'];
+        $report['runtimes'][] = $entry;
+    }
+
+    // Overall: worst status wins.
+    $rank = ['NEEDS_RESTART'=>5,'VULNERABLE'=>5,'UNSUPPORTED'=>4,'UNKNOWN'=>3,'CHECK_VIA_WEB'=>2,'PATCHED'=>1];
+    $worst = 'PATCHED'; $worstRank = 0;
+    foreach ($report['runtimes'] as $r) {
+        $s = $r['verdict']['status'];
+        $sr = $rank[$s] ?? 3;
+        if ($sr > $worstRank) { $worstRank = $sr; $worst = $s; }
+    }
+    $report['overall'] = empty($report['runtimes']) ? 'NO_RUNTIME' : $worst;
+    return $report;
+}
+
+// ---------------------------------------------------------------------------
+// Renderers
+// ---------------------------------------------------------------------------
+
+function render_text(array $r): string
+{
+    $o  = "php2shell-checker — server posture report\n";
+    $o .= str_repeat('=', 64) . "\n";
+    $o .= "CVEs       : " . implode(', ', $r['cves']) . "\n";
+    $o .= "OS family  : {$r['os_family']}\n";
+    $o .= "Scanned    : {$r['scanned_at']}";
+    $o .= ($r['is_root'] === false) ? "   (not root — some probes limited; re-run with sudo)\n" : "\n";
+    $o .= "OVERALL    : {$r['overall']}\n";
+    $o .= str_repeat('=', 64) . "\n";
+
+    if (empty($r['runtimes'])) { $o .= "No PHP runtime found on this host.\n"; return $o; }
+
+    foreach ($r['runtimes'] as $rt) {
+        $v = $rt['verdict'];
+        $o .= "\n• {$rt['label']}";
+        if (!empty($rt['binary'])) $o .= "  [{$rt['binary']}]";
+        $o .= "\n";
+        if (!empty($rt['version'])) $o .= "    version    : {$rt['version']}\n";
+        if (!empty($rt['backport']['package'])) {
+            $o .= "    package    : {$rt['backport']['package']}";
+            if (!empty($rt['backport']['pkg_version'])) $o .= " ({$rt['backport']['pkg_version']})";
+            $o .= "\n";
+        }
+        if (!empty($rt['restart']) && $rt['restart']['state'] !== 'unknown') {
+            $o .= "    restart    : {$rt['restart']['state']}";
+            $o .= " (pkg {$rt['restart']['package_update_time']} vs proc {$rt['restart']['process_start_time']})\n";
+        }
+        $o .= "    VERDICT    : {$v['status']}  [{$v['confidence']}]\n";
+        foreach ($v['evidence'] as $e) {
+            $o .= "      - " . wordwrap($e, 58, "\n        ", true) . "\n";
+        }
+    }
+    $o .= "\n" . str_repeat('-', 64) . "\n";
+    $o .= "Legend: PATCHED ok · NEEDS_RESTART patched but workers must restart ·\n";
+    $o .= "VULNERABLE · UNSUPPORTED (EOL, migrate) · CHECK_VIA_WEB (Apache mod_php) ·\n";
+    $o .= "UNKNOWN. This report only read local metadata — it exploited nothing.\n";
+    return $o;
+}
+
+function render_html(array $r): string
+{
+    $colors = ['PATCHED'=>'#1a7f37','NEEDS_RESTART'=>'#bf8700','VULNERABLE'=>'#cf222e',
+               'UNSUPPORTED'=>'#cf222e','UNKNOWN'=>'#57606a','CHECK_VIA_WEB'=>'#8250df','NO_RUNTIME'=>'#57606a'];
+    $oc = $colors[$r['overall']] ?? '#57606a';
+    $esc = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+
+    $cards = '';
+    foreach ($r['runtimes'] as $rt) {
+        $v = $rt['verdict']; $c = $colors[$v['status']] ?? '#57606a';
+        $meta = '';
+        if (!empty($rt['version']))              $meta .= '<div><b>Version:</b> ' . $esc($rt['version']) . '</div>';
+        if (!empty($rt['backport']['package']))  $meta .= '<div><b>Package:</b> ' . $esc($rt['backport']['package']) . ' ' . $esc($rt['backport']['pkg_version'] ?? '') . '</div>';
+        if (!empty($rt['restart']) && $rt['restart']['state'] !== 'unknown')
+            $meta .= '<div><b>Restart:</b> ' . $esc($rt['restart']['state']) . '</div>';
+        $ev = '';
+        foreach ($v['evidence'] as $e) $ev .= '<li>' . $esc($e) . '</li>';
+        $cards .= '<div class="card"><div class="badge" style="background:' . $c . '">' . $esc($v['status'])
+                . '</div><h3>' . $esc($rt['label']) . '</h3>'
+                . ($rt['binary'] ? '<code>' . $esc($rt['binary']) . '</code>' : '')
+                . '<div class="meta">' . $meta . '</div>'
+                . '<div class="conf">confidence: ' . $esc($v['confidence']) . '</div>'
+                . '<ul>' . $ev . '</ul></div>';
+    }
+
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<title>php2shell-checker report</title><style>'
+        . 'body{font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f8fa;color:#1f2328}'
+        . '.wrap{max-width:860px;margin:0 auto;padding:24px 16px}'
+        . 'h1{font-size:20px;margin:0 0 4px}.sub{color:#57606a;font-size:13px;margin-bottom:16px}'
+        . '.overall{color:#fff;background:' . $oc . ';padding:16px 20px;border-radius:10px;font-size:18px;font-weight:700;margin-bottom:20px}'
+        . '.overall small{display:block;font-weight:400;font-size:12px;opacity:.9;margin-top:4px}'
+        . '.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:16px;margin-bottom:14px;position:relative}'
+        . '.card h3{margin:.2em 0}.badge{position:absolute;top:16px;right:16px;color:#fff;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}'
+        . '.card code{font-size:12px;color:#57606a;word-break:break-all}.meta{margin:8px 0;font-size:13px}'
+        . '.conf{font-size:12px;color:#57606a;margin:4px 0}.card ul{margin:8px 0 0;padding-left:18px;font-size:13px}'
+        . '.foot{color:#57606a;font-size:12px;margin-top:20px}'
+        . '</style></head><body><div class="wrap">'
+        . '<h1>php2shell-checker — server posture report</h1>'
+        . '<div class="sub">' . $esc(implode(', ', $r['cves'])) . ' · OS: ' . $esc($r['os_family']) . ' · ' . $esc($r['scanned_at']) . '</div>'
+        . '<div class="overall">OVERALL: ' . $esc($r['overall'])
+        . '<small>Informational report — version/package/restart/config detection only. No exploitation.</small></div>'
+        . $cards
+        . '<div class="foot">A runtime is safe only once the patched package is installed AND its workers restarted. '
+        . 'Distro backports may keep an old base number; this report checks the package changelog where available.</div>'
+        . '</div></body></html>';
+}
+
+// ---------------------------------------------------------------------------
+// Library guard + entry point
+// ---------------------------------------------------------------------------
+
+if (defined('P2S_INSPECT_LIB')) {
+    return;
+}
+
+if (PHP_SAPI !== 'cli') {
+    header('Content-Type: text/plain; charset=utf-8', true, 403);
+    echo "inspect.php is a CLI tool — run it from a shell on the server.\n";
+    exit(3);
+}
+
+$args = $argv ?? [];
+$report = full_scan();
+
+if (in_array('--json', $args, true)) {
+    echo json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
+} elseif (($i = array_search('--html', $args, true)) !== false) {
+    $dest = $args[$i + 1] ?? '-';
+    $html = render_html($report);
+    if ($dest === '-' || $dest === null) {
+        echo $html, "\n";
+    } else {
+        file_put_contents($dest, $html);
+        echo "HTML report written to: $dest\n";
+    }
+} else {
+    echo render_text($report);
+}
+
+$exit = ['PATCHED'=>0,'CHECK_VIA_WEB'=>0,'NEEDS_RESTART'=>1,'VULNERABLE'=>1,'UNSUPPORTED'=>1,'UNKNOWN'=>2,'NO_RUNTIME'=>2];
+exit($exit[$report['overall']] ?? 2);

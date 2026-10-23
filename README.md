@@ -12,6 +12,21 @@ code execution flaws in the PHP engine, fixed on 2026-10-21.
 > no payloads and exploits nothing. Use it to check systems **you own or are
 > authorized to test**.
 
+### Why more than a header scanner?
+
+Any online service can read a PHP version from HTTP headers — and most hardened
+servers hide it anyway. The hard questions can only be answered **on the
+server**, and `inspect.php` answers them:
+
+- **Backport detection** — did your distro backport the fix while keeping an old
+  base version number? Reads the package changelog (`dpkg`/`rpm`) for the CVE
+  ids and gives a *definitive* verdict instead of a version guess.
+- **Restart-after-patch detection** — a patched package whose `php-fpm`/`apache`
+  workers were never restarted is **still vulnerable**. It compares the package
+  update time against the worker start time and flags `NEEDS_RESTART`.
+- **Multi-runtime / multi-SAPI inventory** + the risk-relevant `php.ini` settings.
+- **Consolidated report with evidence** — text, JSON, or a shareable HTML page.
+
 ---
 
 ## 🇷🇴 Română
@@ -45,7 +60,20 @@ formular de login — rulează înainte de codul aplicației.
 
 ### Cum se folosește
 
-**1. Pe server (recomandat — cel mai precis):**
+**0. Raport complet de posture pe server (recomandat — cel mai complet):**
+
+```bash
+php inspect.php                      # raport text: backport + restart + config + verdict
+php inspect.php --json               # JSON structurat (cu dovezi)
+php inspect.php --html raport.html   # raport HTML de partajat (sau `-` pentru stdout)
+```
+
+Rulează ca **root/sudo** ca să vadă toate runtime-urile, log-urile de pachete și
+orele de start ale proceselor. Verdicte posibile: `PATCHED`, `NEEDS_RESTART`
+(patch instalat dar workerii nereporniti → încă vulnerabil), `VULNERABLE`,
+`UNSUPPORTED` (EOL), `CHECK_VIA_WEB` (Apache mod_php), `UNKNOWN`.
+
+**1. Verificare rapidă pe runtime (mai simplă):**
 
 ```bash
 chmod +x php2shell-check.sh
@@ -111,7 +139,13 @@ full package revision against your vendor's advisory.
 ### Usage
 
 ```bash
-# On the server (recommended): scan CLI, FPM, Apache, docker
+# Full posture report (recommended): backport + restart + config + verdict
+php inspect.php                      # text
+php inspect.php --json               # structured JSON with evidence
+php inspect.php --html report.html   # shareable HTML report (or - for stdout)
+#   run as root/sudo for full coverage of packages, logs and process times
+
+# Quick per-runtime scan: CLI, FPM, Apache, docker
 ./php2shell-check.sh
 ./php2shell-check.sh --json
 
