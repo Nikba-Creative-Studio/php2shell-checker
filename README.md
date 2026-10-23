@@ -66,7 +66,14 @@ formular de login — rulează înainte de codul aplicației.
 php inspect.php                      # raport text: backport + restart + config + verdict
 php inspect.php --json               # JSON structurat (cu dovezi)
 php inspect.php --html raport.html   # raport HTML de partajat (sau `-` pentru stdout)
+php inspect.php --recommend          # pași de remediere PERSONALIZAȚI pentru ce a găsit
+php inspect.php --recommend --json   # aceleași recomandări, în JSON
 ```
+
+`--recommend` scoate acțiuni ordonate pe severitate (CRITICAL→INFO) cu comenzi
+gata de copiat, adaptate la distribuția și la constatările tale: ce branch de
+patch-uit, ce serviciu de repornit (`NEEDS_RESTART`), ce să migrezi (EOL), ce
+container de reconstruit, plus igiena de config (`expose_php`, upload_progress).
 
 Rulează ca **root/sudo** ca să vadă toate runtime-urile, log-urile de pachete și
 orele de start ale proceselor. Verdicte posibile: `PATCHED`, `NEEDS_RESTART`
@@ -143,6 +150,8 @@ full package revision against your vendor's advisory.
 php inspect.php                      # text
 php inspect.php --json               # structured JSON with evidence
 php inspect.php --html report.html   # shareable HTML report (or - for stdout)
+php inspect.php --recommend          # TAILORED remediation steps for what it found
+php inspect.php --recommend --json   # same recommendations, as JSON
 #   run as root/sudo for full coverage of packages, logs and process times
 
 # Quick per-runtime scan: CLI, FPM, Apache, docker

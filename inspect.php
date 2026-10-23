@@ -502,6 +502,205 @@ function render_html(array $r): string
 }
 
 // ---------------------------------------------------------------------------
+// Tailored recommendations (from the scan findings)
+// ---------------------------------------------------------------------------
+
+/** Is an ini boolean-ish value effectively "on"? */
+function p2s_ini_on($val): bool
+{
+    return !in_array(strtolower((string)$val), ['', '0', 'off', 'false', 'no'], true);
+}
+
+/** Distro-specific patch+restart commands for a given branch. */
+function p2s_patch_cmds(string $family, string $branch): array
+{
+    if ($family === 'debian') {
+        return [
+            "sudo apt update && sudo apt upgrade php{$branch}-fpm php{$branch}-cli php{$branch}-common",
+            "sudo systemctl restart php{$branch}-fpm   # or: sudo systemctl restart apache2 (mod_php)",
+        ];
+    }
+    if ($family === 'rhel') {
+        return [
+            'sudo dnf update php php-fpm php-common',
+            'sudo systemctl restart php-fpm   # or: sudo systemctl restart httpd (mod_php)',
+        ];
+    }
+    if ($family === 'alpine') {
+        return [
+            'sudo apk upgrade php* ',
+            'sudo rc-service php-fpm' . str_replace('.', '', $branch) . ' restart',
+        ];
+    }
+    return ["Install the patched PHP {$branch} package for your platform (>= fixed release), then restart php-fpm/apache."];
+}
+
+/**
+ * Build a de-duplicated, severity-ranked list of recommendations.
+ * @return array<int,array{severity:string,title:string,detail:string,commands:array}>
+ */
+function build_recommendations(array $report): array
+{
+    $fam = $report['os_family'];
+    $patchBranches = [];   // branch => true
+    $restartSvc    = [];   // service => true
+    $eolBranches   = [];   // branch => true
+    $apacheWeb     = false;
+    $dockerImages  = [];
+    $unknown       = [];
+    $exposePhp     = false;
+    $uploadProg    = false;
+
+    foreach ($report['runtimes'] as $rt) {
+        $status = $rt['verdict']['status'];
+        $branch = null;
+        if (!empty($rt['version']) && preg_match('/^(\d+\.\d+)/', $rt['version'], $m)) $branch = $m[1];
+
+        switch ($status) {
+            case 'VULNERABLE':
+                if ($branch) $patchBranches[$branch] = true;
+                break;
+            case 'NEEDS_RESTART':
+                $svc = $rt['restart']['service'] ?? null;
+                if (!$svc) $svc = ($fam === 'debian' && $branch) ? "php{$branch}-fpm" : 'php-fpm';
+                $restartSvc[$svc] = true;
+                break;
+            case 'UNSUPPORTED':
+                if ($branch) $eolBranches[$branch] = true;
+                break;
+            case 'CHECK_VIA_WEB':
+                $apacheWeb = true;
+                break;
+            case 'UNKNOWN':
+                $unknown[] = $rt['label'];
+                break;
+        }
+        if ($rt['kind'] === 'docker' && in_array($status, ['VULNERABLE', 'NEEDS_RESTART', 'UNKNOWN'], true)) {
+            $dockerImages[] = $rt['container'] ?? $rt['label'];
+        }
+        $ini = $rt['ini'] ?? [];
+        if (array_key_exists('expose_php', $ini) && p2s_ini_on($ini['expose_php'])) $exposePhp = true;
+        if (array_key_exists('session.upload_progress.enabled', $ini) && p2s_ini_on($ini['session.upload_progress.enabled'])) $uploadProg = true;
+    }
+
+    $recs = [];
+
+    foreach (array_keys($patchBranches) as $branch) {
+        $recs[] = [
+            'severity' => 'CRITICAL',
+            'title'    => "Patch PHP {$branch} and restart its workers",
+            'detail'   => "A runtime on branch {$branch} is below the fixed release. Install the patched package AND restart — upgrading alone leaves old workers running the vulnerable code.",
+            'commands' => p2s_patch_cmds($fam, $branch),
+        ];
+    }
+
+    foreach (array_keys($restartSvc) as $svc) {
+        $recs[] = [
+            'severity' => 'CRITICAL',
+            'title'    => "Restart {$svc} — patched package not yet loaded",
+            'detail'   => 'The installed package is patched, but the running workers started BEFORE the update, so they still execute the old build. A restart fixes this immediately; no reinstall needed.',
+            'commands' => ["sudo systemctl restart {$svc}"],
+        ];
+    }
+
+    foreach (array_keys($eolBranches) as $branch) {
+        $recs[] = [
+            'severity' => 'HIGH',
+            'title'    => "Migrate off end-of-life PHP {$branch}",
+            'detail'   => "PHP {$branch} is end-of-life and gets no official fix for these CVEs. Plan a migration to a supported branch (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12+). Until then the server stays exposed — isolate it and prioritise.",
+            'commands' => [],
+        ];
+    }
+
+    if ($dockerImages) {
+        $recs[] = [
+            'severity' => 'HIGH',
+            'title'    => 'Rebuild affected container image(s): ' . implode(', ', array_unique($dockerImages)),
+            'detail'   => 'Restarting an old container keeps the vulnerable image. Pull a patched base image and rebuild — do not just `docker restart`.',
+            'commands' => ['docker pull <image>:<patched-tag>', 'docker compose up -d --build'],
+        ];
+    }
+
+    if ($apacheWeb) {
+        $recs[] = [
+            'severity' => 'HIGH',
+            'title'    => 'Test & patch Apache mod_php (highest-risk SAPI)',
+            'detail'   => 'mod_php is loaded; its build cannot be read from the CLI. Test the real web runtime, then patch the matching PHP package and restart apache.',
+            'commands' => [
+                'cp check.php /var/www/html/   # then set ALLOW_WEB=true in it',
+                '# open https://your-site/check.php in a browser, read the result, then:',
+                'rm /var/www/html/check.php    # delete immediately',
+                ($fam === 'rhel' ? 'sudo systemctl restart httpd' : 'sudo systemctl restart apache2'),
+            ],
+        ];
+    }
+
+    if ($unknown) {
+        $recs[] = [
+            'severity' => 'MEDIUM',
+            'title'    => 'Manually verify runtime(s): ' . implode(', ', array_unique($unknown)),
+            'detail'   => 'Version or branch could not be mapped automatically. Check the running version against the PHP.net advisory for CVE-2026-109618 / CVE-2026-109619.',
+            'commands' => [],
+        ];
+    }
+
+    if ($exposePhp) {
+        $recs[] = [
+            'severity' => 'LOW',
+            'title'    => 'Hygiene: hide the PHP version (expose_php = Off)',
+            'detail'   => 'expose_php is On, so PHP advertises its version in the X-Powered-By header. This does NOT fix the CVE — it only cuts automated reconnaissance. Best fixed in php.ini (covers all web servers).',
+            'commands' => ['; php.ini', 'expose_php = Off', '# then restart php-fpm/apache; see RECOMMENDATIONS.md for Apache/Nginx/Cloudflare'],
+        ];
+    }
+
+    if ($uploadProg) {
+        $recs[] = [
+            'severity' => 'LOW',
+            'title'    => 'Temporary mitigation: disable session.upload_progress',
+            'detail'   => 'Only until you patch — this reduces one attack path but is NOT a fix.',
+            'commands' => ['; php.ini', 'session.upload_progress.enabled = Off', 'sudo systemctl restart php-fpm   # pick up the setting'],
+        ];
+    }
+
+    if (!$recs) {
+        $recs[] = [
+            'severity' => 'INFO',
+            'title'    => 'All detected runtimes are patched and restarted',
+            'detail'   => 'No action required for these CVEs on the runtimes this scan could see. Re-run after any future PHP update, and remember a patch does not remove files/accounts created before patching.',
+            'commands' => [],
+        ];
+    }
+
+    // Severity ordering.
+    $rank = ['CRITICAL' => 0, 'HIGH' => 1, 'MEDIUM' => 2, 'LOW' => 3, 'INFO' => 4];
+    usort($recs, fn($a, $b) => ($rank[$a['severity']] ?? 9) <=> ($rank[$b['severity']] ?? 9));
+    return $recs;
+}
+
+function render_recommendations(array $report, array $recs): string
+{
+    $o  = "php2shell-checker — recommended actions\n";
+    $o .= str_repeat('=', 64) . "\n";
+    $o .= "OS family  : {$report['os_family']}    OVERALL: {$report['overall']}\n";
+    if ($report['is_root'] === false) $o .= "(not root — some probes limited; re-run with sudo for full coverage)\n";
+    $o .= str_repeat('=', 64) . "\n";
+    $n = 0;
+    foreach ($recs as $r) {
+        $n++;
+        $o .= "\n[{$r['severity']}] {$n}. {$r['title']}\n";
+        $o .= '    ' . wordwrap($r['detail'], 58, "\n    ", true) . "\n";
+        if (!empty($r['commands'])) {
+            $o .= "    ---\n";
+            foreach ($r['commands'] as $c) $o .= "    $ " . $c . "\n";
+        }
+    }
+    $o .= "\n" . str_repeat('-', 64) . "\n";
+    $o .= "Full checklist & per-server snippets: RECOMMENDATIONS.md\n";
+    $o .= "These are informational suggestions based on a read-only scan.\n";
+    return $o;
+}
+
+// ---------------------------------------------------------------------------
 // Library guard + entry point
 // ---------------------------------------------------------------------------
 
@@ -517,6 +716,18 @@ if (PHP_SAPI !== 'cli') {
 
 $args = $argv ?? [];
 $report = full_scan();
+
+if (in_array('--recommend', $args, true)) {
+    $recs = build_recommendations($report);
+    if (in_array('--json', $args, true)) {
+        echo json_encode(['overall' => $report['overall'], 'os_family' => $report['os_family'], 'recommendations' => $recs],
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
+    } else {
+        echo render_recommendations($report, $recs);
+    }
+    $exitR = ['PATCHED' => 0, 'CHECK_VIA_WEB' => 0, 'NEEDS_RESTART' => 1, 'VULNERABLE' => 1, 'UNSUPPORTED' => 1, 'UNKNOWN' => 2, 'NO_RUNTIME' => 2];
+    exit($exitR[$report['overall']] ?? 2);
+}
 
 if (in_array('--json', $args, true)) {
     echo json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
